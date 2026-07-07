@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import List, Optional, Union
 
@@ -41,10 +41,17 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import NHDHeadMismatchMapper
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.staging import (
+    NHDStagingBufferLease,
+    NHDStagingBufferManager,
+    NHDStagingPlan,
+    build_nhd_staging_plan,
+)
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -62,6 +69,10 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
 
+def _nhd_staging_enabled() -> bool:
+    return os.environ.get("TRTLLM_NHD_DISAGG_STAGING", "0") == "1"
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -77,6 +88,8 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
+    nhd_staging_ptr: Optional[int] = None
+    nhd_staging_size: int = 0
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -92,6 +105,8 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
+                "nhd_staging_ptr": self.nhd_staging_ptr,
+                "nhd_staging_size": self.nhd_staging_size,
             }
         )
 
@@ -131,6 +146,16 @@ class WriteMeta:
     slice_id: Optional[int] = None
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
+    local_staging: Optional[torch.Tensor] = None
+    local_staging_lease: Optional[NHDStagingBufferLease] = None
+    local_staging_plan: Optional[NHDStagingPlan] = None
+    remote_staging_ptr: Optional[int] = None
+
+
+@dataclass
+class NHDRecvStaging:
+    plan: NHDStagingPlan
+    tensor: torch.Tensor
 
 
 class MessageType:
@@ -231,10 +256,12 @@ class Sender(SenderBase):
         self,
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
+        staging_manager: Optional[NHDStagingBufferManager] = None,
     ):
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
+        self._staging_manager = staging_manager
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -468,10 +495,37 @@ class Sender(SenderBase):
 
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
-        assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
-            f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
+        try:
+            self._deliver_kv_to_agent_impl(write_meta)
+        finally:
+            lease = write_meta.local_staging_lease
+            if lease is not None:
+                lease.release()
+                write_meta.local_staging_lease = None
+                write_meta.local_staging = None
+
+    def _prepare_nhd_staging_write(self, write_meta: WriteMeta) -> None:
+        plan = write_meta.local_staging_plan
+        if plan is None:
+            return
+        if self._staging_manager is None or write_meta.remote_staging_ptr is None:
+            raise RuntimeError("NHD staging write is missing its buffer manager or remote pointer")
+        lease = self._staging_manager.acquire("send", plan.payload_bytes)
+        write_meta.local_staging_lease = lease
+        write_meta.local_staging = lease.tensor
+        plan.pack_into(lease.tensor)
+        torch.cuda.current_stream(self._device_id).synchronize()
+        write_meta.src_ptrs = np.concatenate(
+            [write_meta.src_ptrs, np.array([lease.tensor.data_ptr()], dtype=np.int64)]
+        )
+        write_meta.dst_ptrs = np.concatenate(
+            [write_meta.dst_ptrs, np.array([write_meta.remote_staging_ptr], dtype=np.int64)]
+        )
+        write_meta.sizes = np.concatenate(
+            [write_meta.sizes, np.array([plan.payload_bytes], dtype=np.int64)]
         )
 
+    def _deliver_kv_to_agent_impl(self, write_meta: WriteMeta):
         with self._sessions_lock:
             session = self._get_session(write_meta.unique_rid)
         if session is None:
@@ -518,6 +572,17 @@ class Sender(SenderBase):
                 ]
             )
             return
+
+        # Pack only after the session has entered TRANSFERRING. This preserves
+        # the existing cancellation contract: KV pages cannot be reclaimed
+        # while the staging gather reads them.
+        self._prepare_nhd_staging_write(write_meta)
+        if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
+            raise ValueError(
+                f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}: "
+                f"src={write_meta.src_ptrs.size}, dst={write_meta.dst_ptrs.size}, "
+                f"sizes={write_meta.sizes.size}"
+            )
 
         agent_result = AgentResult.SUCCESS
         if write_meta.src_ptrs.size > 0:
@@ -782,6 +847,10 @@ class Sender(SenderBase):
         pool_mapping = self._registrar.get_pool_mapping(peer_ri)
         dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
         src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
+        staging_src_block_ids = list(src_block_ids_per_groups)
+        staging_dst_block_ids = list(dst_block_ids_per_groups)
+        use_nhd_staging = req_info.nhd_staging_ptr is not None
+        has_nhd_staging_pool = False
 
         aligned_blocks_by_layer_groups: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
@@ -814,12 +883,37 @@ class Sender(SenderBase):
                 dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
             )
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            if use_nhd_staging and isinstance(mapper, NHDHeadMismatchMapper):
+                staging_src_block_ids[self_lg] = src_block_ids
+                staging_dst_block_ids[peer_lg] = dst_block_ids
+                has_nhd_staging_pool = True
+                continue
             region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
             for rp in region_pairs:
                 src_frag_parts.append(rp.src.memory.ptrs)
                 dst_frag_parts.append(rp.dst.memory.ptrs)
                 size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+
+        staging_plan = None
+        if has_nhd_staging_pool:
+            staging_plan = build_nhd_staging_plan(
+                self._registrar,
+                peer_ri,
+                staging_src_block_ids,
+                staging_dst_block_ids,
+            )
+            if staging_plan.payload_bytes != req_info.nhd_staging_size:
+                raise ValueError(
+                    "NHD staging size mismatch between sender and receiver: "
+                    f"sender={staging_plan.payload_bytes}, "
+                    f"receiver={req_info.nhd_staging_size}, "
+                    f"request={task._unique_rid}, peer_rank={peer_ri.instance_rank}"
+                )
+            if self._staging_manager is None:
+                raise RuntimeError(
+                    "Peer requested NHD staging, but no preregistered staging manager exists"
+                )
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
@@ -851,7 +945,12 @@ class Sender(SenderBase):
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, int(kv_sizes.sum()), dst_frags.size)
+            staged_bytes = staging_plan.payload_bytes if staging_plan is not None else 0
+            timer.record_transfer_sizes(
+                peer_ri.instance_rank,
+                int(kv_sizes.sum()) + staged_bytes,
+                dst_frags.size + (1 if staging_plan is not None else 0),
+            )
 
         return WriteMeta(
             task=task,
@@ -866,6 +965,8 @@ class Sender(SenderBase):
             unique_rid=task._unique_rid,
             slice_id=task.slice_id,
             is_last_slice=task._slice.is_last_slice,
+            local_staging_plan=staging_plan,
+            remote_staging_ptr=req_info.nhd_staging_ptr,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1373,6 +1474,65 @@ class KVRecvTask:
         self._exception: Optional[Exception] = None
         self._aux_slot = aux_slot
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
+        self._nhd_staging: dict[int, NHDRecvStaging] = {}
+        self._nhd_staging_lease: Optional[NHDStagingBufferLease] = None
+        self._nhd_staging_lock = threading.Lock()
+        self._nhd_active_scatters = 0
+
+    def set_nhd_staging_lease(self, lease: NHDStagingBufferLease) -> None:
+        with self._nhd_staging_lock:
+            if self._nhd_staging_lease is not None:
+                raise ValueError("NHD receive staging lease is already assigned")
+            self._nhd_staging_lease = lease
+
+    def add_nhd_staging(
+        self,
+        peer_rank: int,
+        plan: NHDStagingPlan,
+        tensor: torch.Tensor,
+    ) -> None:
+        with self._nhd_staging_lock:
+            if peer_rank in self._nhd_staging:
+                raise ValueError(f"NHD receive staging already exists for peer rank {peer_rank}")
+            self._nhd_staging[peer_rank] = NHDRecvStaging(plan, tensor)
+
+    def get_nhd_staging(self, peer_rank: int) -> Optional[NHDRecvStaging]:
+        with self._nhd_staging_lock:
+            return self._nhd_staging.get(peer_rank)
+
+    def _release_nhd_staging_lease_if_done_locked(self) -> None:
+        if self._nhd_staging or self._nhd_active_scatters or self._nhd_staging_lease is None:
+            return
+        self._nhd_staging_lease.release()
+        self._nhd_staging_lease = None
+
+    def scatter_and_release_nhd_staging(
+        self,
+        peer_rank: int,
+    ) -> None:
+        with self._nhd_staging_lock:
+            state = self._nhd_staging.pop(peer_rank, None)
+            if state is not None:
+                self._nhd_active_scatters += 1
+        if state is None:
+            return
+        try:
+            state.plan.scatter_from(state.tensor)
+            torch.cuda.current_stream(state.tensor.device).synchronize()
+        finally:
+            with self._nhd_staging_lock:
+                self._nhd_active_scatters -= 1
+                self._release_nhd_staging_lease_if_done_locked()
+
+    def release_nhd_staging(self) -> None:
+        with self._nhd_staging_lock:
+            self._nhd_staging.clear()
+            self._release_nhd_staging_lease_if_done_locked()
+
+    def discard_nhd_staging(self, peer_rank: int) -> None:
+        with self._nhd_staging_lock:
+            self._nhd_staging.pop(peer_rank, None)
+            self._release_nhd_staging_lease_if_done_locked()
 
     def fail(self, exc: Exception) -> None:
         self._exception = exc
@@ -1409,11 +1569,14 @@ class Receiver(ReceiverBase):
         self,
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
+        staging_manager: Optional[NHDStagingBufferManager] = None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
+        self._staging_manager = staging_manager
         self._dealers = {}
         self._sender_ep_instance_map = {}
+        self._reverse_registrar_cache: dict[str, PeerRegistrar] = {}
 
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
@@ -1484,6 +1647,50 @@ class Receiver(ReceiverBase):
             slice_id=task.slice_id,
         )
 
+    @staticmethod
+    def _rank_info_for_rank(template: RankInfo, rank: int) -> RankInfo:
+        if template.attention is None:
+            raise ValueError("NHD staging requires attention rank metadata")
+        tp_rank = rank % template.tp_size
+        cp_rank = (rank // template.tp_size) % template.cp_size
+        pp_rank = rank // (template.tp_size * template.cp_size)
+        dp_rank = tp_rank if template.attention.enable_attention_dp else 0
+        return replace(
+            template,
+            instance_rank=rank,
+            tp_rank=tp_rank,
+            cp_rank=cp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+        )
+
+    def _build_nhd_staging_plan(
+        self,
+        task: KVRecvTask,
+        sender_template: RankInfo,
+        sender_rank: int,
+    ) -> NHDStagingPlan | None:
+        sender_ri = self._rank_info_for_rank(sender_template, sender_rank)
+        key = f"{sender_ri.instance_name}:{sender_rank}"
+        registrar = self._reverse_registrar_cache.get(key)
+        if registrar is None:
+            if sender_ri.page_table is None:
+                raise ValueError("NHD staging requires a sender page table")
+            registrar = PeerRegistrar(sender_ri, KVRegionExtractorV1(sender_ri.page_table))
+            receiver_ri = self._registrar.self_rank_info
+            registrar.register(receiver_ri.instance_name, receiver_ri.instance_rank, receiver_ri)
+            self._reverse_registrar_cache[key] = registrar
+
+        plan = build_nhd_staging_plan(
+            registrar,
+            self._registrar.self_rank_info,
+            None,
+            task._kv_slice.block_ids_per_layer_groups,
+        )
+        if plan.payload_bytes == 0:
+            return None
+        return plan
+
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
         logger.debug(
@@ -1532,10 +1739,45 @@ class Receiver(ReceiverBase):
         session._sender_endpoints.update(
             peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks
         )
-        for rank in peer_overlap.ranks:
+        requests: list[tuple[int, RecvReqInfo]] = []
+        try:
+            plans: dict[int, NHDStagingPlan] = {}
+            if self._staging_manager is not None and sender_dp_rank is not None:
+                for rank in peer_overlap.ranks:
+                    plan = self._build_nhd_staging_plan(task, peer_infos, rank)
+                    if plan is not None:
+                        plans[rank] = plan
+
+            if plans:
+                total_bytes = sum(plan.payload_bytes for plan in plans.values())
+                lease = self._staging_manager.acquire("recv", total_bytes)
+                task.set_nhd_staging_lease(lease)
+                offset = 0
+                for rank, plan in plans.items():
+                    end = offset + plan.payload_bytes
+                    task.add_nhd_staging(rank, plan, lease.tensor[offset:end])
+                    offset = end
+
+            for rank in peer_overlap.ranks:
+                request_for_rank = replace(receiver_req)
+                # Gen-first ADP broadcasts to ranks that may never own this
+                # request. Keep that path on direct descriptors until staging
+                # allocation is negotiated rather than preallocated per DP group.
+                if self._staging_manager is not None and sender_dp_rank is not None:
+                    staging = task.get_nhd_staging(rank)
+                    if staging is not None:
+                        request_for_rank.nhd_staging_ptr = staging.tensor.data_ptr()
+                        request_for_rank.nhd_staging_size = staging.plan.payload_bytes
+                requests.append((rank, request_for_rank))
+        except Exception as exc:
+            task.release_nhd_staging()
+            task.fail(exc)
+            raise
+
+        for rank, request_for_rank in requests:
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
-            self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req)
+            self._request_sender_data(peer_infos.sender_endpoints[rank], request_for_rank)
         return
 
     @staticmethod
@@ -1772,6 +2014,17 @@ class RxSession(RxSessionBase):
             )
             task = self._kv_tasks[sender_slice_id]
             if status == AgentResult.SUCCESS:
+                try:
+                    task.scatter_and_release_nhd_staging(peer_rank)
+                except Exception as exc:
+                    task.fail(exc)
+                    if self._terminal_status is None:
+                        self._terminal_status = SessionStatus.ERROR
+                    logger.error(
+                        f"NHD staging scatter failed for request {self.request_id}, "
+                        f"slice={sender_slice_id}, peer_rank={peer_rank}: {exc}"
+                    )
+                    return
                 if is_last_slice:
                     task.last_slice_count += 1
                     if task.last_slice_count == task.expected_transfers:
@@ -1786,6 +2039,7 @@ class RxSession(RxSessionBase):
                         ri = self._receiver._registrar.self_rank_info
                         task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
             elif status == AgentResult.FAILED:
+                task.discard_nhd_staging(peer_rank)
                 detail = (
                     f"KV transfer failed for request {self.request_id} slice={sender_slice_id} "
                     f"peer_rank={peer_rank} is_last_slice={is_last_slice} "
@@ -1937,6 +2191,8 @@ class RxSession(RxSessionBase):
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None
+        for task in self._kv_tasks:
+            task.release_nhd_staging()
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
             self._receiver.clear_session(self.disagg_request_id)
@@ -2039,6 +2295,7 @@ class TransferWorkerConfig:
     device_id: int
     instance_name: str
     max_concurrent_sessions: int = 0
+    max_tokens_in_buffer: Optional[int] = None
     max_draft_len: Optional[int] = None
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
@@ -2112,12 +2369,23 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
         self._registered_mem: list = []
+        self._nhd_staging_manager: Optional[NHDStagingBufferManager] = None
         try:
             self._register_kv_cache()
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
-            self._sender = Sender(self._peer_registrar, self._agent)
-            self._receiver = Receiver(self._peer_registrar, self._agent)
+            if _nhd_staging_enabled():
+                self._register_nhd_staging_buffers()
+            self._sender = Sender(
+                self._peer_registrar,
+                self._agent,
+                self._nhd_staging_manager,
+            )
+            self._receiver = Receiver(
+                self._peer_registrar,
+                self._agent,
+                self._nhd_staging_manager,
+            )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:
@@ -2150,6 +2418,23 @@ class TransferWorker:
         self._agent.register_memory(reg_memory_desc)
         logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")
         self._registered_mem.append(reg_memory_desc)
+
+    def _register_nhd_staging_buffers(self) -> None:
+        if self._rank_info.page_table is None:
+            raise RuntimeError("NHD staging requires a V2 KV-cache page table")
+        manager = NHDStagingBufferManager(
+            self._rank_info.page_table,
+            self._rank_info.device_id,
+            self._config.max_tokens_in_buffer or 0,
+        )
+        memory_descs = manager.memory_descs
+        if not memory_descs:
+            logger.info("NHD staging was enabled, but this rank has no NHD cache pools")
+            return
+        registration = RegMemoryDescs("VRAM", memory_descs)
+        self._agent.register_memory(registration)
+        self._registered_mem.append(registration)
+        self._nhd_staging_manager = manager
 
     @property
     def rank_info_server_endpoint(self) -> Optional[str]:
@@ -2192,6 +2477,13 @@ class TransferWorker:
                     agent.deregister_memory(desc)
                 except Exception as e:
                     logger.warning(f"TransferWorker.shutdown: deregister_memory failed: {e}")
+            staging_manager = getattr(self, "_nhd_staging_manager", None)
+            if staging_manager is not None:
+                try:
+                    staging_manager.close()
+                except Exception as e:
+                    logger.warning(f"TransferWorker.shutdown: staging buffer free failed: {e}")
+                self._nhd_staging_manager = None
             try:
                 agent.shutdown()
             except Exception as e:

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
@@ -73,7 +74,7 @@ class PeerRegistrar:
                 if self_page_table.layer_groups[layer_group_id].pool_views[pool_idx].mapper_kind
                 == MapperKind.NHD
             )
-            if nhd_fragments_per_token:
+            if nhd_fragments_per_token and os.environ.get("TRTLLM_NHD_DISAGG_STAGING", "0") != "1":
                 local_heads = self._ri.attention.kv_heads_per_rank
                 peer_heads = peer_ri.attention.kv_heads_per_rank
                 logger.warning_once(

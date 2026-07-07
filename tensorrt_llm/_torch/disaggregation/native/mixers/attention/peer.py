@@ -376,6 +376,25 @@ class NHDHeadMismatchMapper(HeadMismatchMapper):
             bytes_per_head=self_bytes_per_token_head,
         )
 
+        # Retain the logical geometry for the optional contiguous staging
+        # path. The descriptor mapper below and the staging formatter must use
+        # exactly the same layer/head selection.
+        self.transfer_layers = transfer_layers
+        self.src_layer_offset = src_layer_off
+        self.dst_layer_offset = peer_layer_off
+        self.src_pool_num_layers = self_pool_num_layers
+        self.dst_pool_num_layers = peer_pool_num_layers
+        self.src_buffers_per_layer = self_buffers_per_layer
+        self.dst_buffers_per_layer = peer_buffers_per_layer
+        self.tokens_per_block = self_tpb
+        self.src_heads = self_heads
+        self.dst_heads = peer_heads
+        self.src_bytes_per_token_head = self_bytes_per_token_head
+        self.dst_bytes_per_token_head = peer_bytes_per_token_head
+        self.src_head_index = src_head_off // self_bytes_per_token_head
+        self.dst_head_index = dst_head_off // peer_bytes_per_token_head
+        self.contiguous_heads = min(self_heads, peer_heads)
+
         self._src_flat_offsets = self._build_flat_offsets(
             transfer_layers=transfer_layers,
             layer_offset=src_layer_off,

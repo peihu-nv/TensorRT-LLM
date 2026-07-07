@@ -83,6 +83,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
                 # large multiplier is cheap.
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
+                max_tokens_in_buffer=cache_transceiver_config.max_tokens_in_buffer,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
             )
