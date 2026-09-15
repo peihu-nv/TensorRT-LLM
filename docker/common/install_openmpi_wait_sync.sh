@@ -40,7 +40,9 @@ git apply --check --no-index "${OPENMPI_PATCH}"
 git apply --no-index "${OPENMPI_PATCH}"
 
 unset PMIX_VERSION
-./configure \
+# HPC-X 2.50's relocated ucx.pc still points at the absent ucx/mt prefix.
+# Prefer the explicit --with-ucx prefix below over that stale metadata.
+ucx_USE_PKG_CONFIG=0 ./configure \
     --prefix="${OPENMPI_PREFIX}" \
     --with-libevent=internal \
     --enable-mpi1-compatibility \
