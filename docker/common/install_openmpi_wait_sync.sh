@@ -83,7 +83,9 @@ while IFS=$'\t' read -r relative_path rpath; do
 done < "${rpath_manifest}"
 
 pml_ucx="${OPENMPI_PREFIX}/lib/openmpi/mca_pml_ucx.so"
-if ! ldd "${pml_ucx}" | grep -Fq "libmpi.so.40 => ${OPENMPI_PREFIX}/lib/"; then
+pml_libmpi="$(ldd "${pml_ucx}" | awk '$1 ~ /^libmpi\.so/ {print $3; exit}')"
+if [[ -z "${pml_libmpi}" ]] \
+    || [[ "$(readlink -f "${pml_libmpi}")" != "$(readlink -f "${OPENMPI_PREFIX}/lib/libmpi.so.40")" ]]; then
     echo "Patched OpenMPI 5 UCX PML does not resolve its matching libmpi" >&2
     ldd "${pml_ucx}" >&2
     exit 1
