@@ -30,6 +30,23 @@ fi
 source_dir="$(mktemp -d /tmp/openmpi-wait-sync.XXXXXX)"
 trap 'rm -rf "${source_dir}"' EXIT
 
+# HPC-X relocates OpenMPI after building it and gives its ELF objects relative
+# RUNPATHs.  A plain in-place `make install` replaces those objects with ones
+# that have no RUNPATH, allowing the loader to satisfy OpenMPI 5 dependencies
+# from the sibling OpenMPI 4 prefix.  Preserve the package's path-specific
+# RUNPATHs and restore them after installing the patched build.
+rpath_manifest="${source_dir}/hpcx-openmpi5-rpaths.tsv"
+while IFS= read -r -d '' elf; do
+    if rpath="$(patchelf --print-rpath "${elf}" 2>/dev/null)" && [[ -n "${rpath}" ]]; then
+        printf '%s\t%s\n' "${elf#${OPENMPI_PREFIX}/}" "${rpath}" >> "${rpath_manifest}"
+    fi
+done < <(find "${OPENMPI_PREFIX}" -type f -print0)
+
+if [[ ! -s "${rpath_manifest}" ]]; then
+    echo "No HPC-X OpenMPI 5 RUNPATHs were found to preserve" >&2
+    exit 1
+fi
+
 tar -xzf "${OPENMPI_SOURCE_ARCHIVE}" --strip-components=1 -C "${source_dir}"
 cd "${source_dir}"
 if git apply --reverse --check --no-index "${OPENMPI_PATCH}"; then
@@ -55,5 +72,21 @@ ucx_USE_PKG_CONFIG=0 ./configure \
     --with-ucc=/opt/hpcx/ucc
 make -j"$(nproc)"
 make install
+
+while IFS=$'\t' read -r relative_path rpath; do
+    installed_elf="${OPENMPI_PREFIX}/${relative_path}"
+    if [[ ! -f "${installed_elf}" ]]; then
+        echo "OpenMPI install did not reproduce ${relative_path}" >&2
+        exit 1
+    fi
+    patchelf --set-rpath "${rpath}" "${installed_elf}"
+done < "${rpath_manifest}"
+
+pml_ucx="${OPENMPI_PREFIX}/lib/openmpi/mca_pml_ucx.so"
+if ! ldd "${pml_ucx}" | grep -Fq "libmpi.so.40 => ${OPENMPI_PREFIX}/lib/"; then
+    echo "Patched OpenMPI 5 UCX PML does not resolve its matching libmpi" >&2
+    ldd "${pml_ucx}" >&2
+    exit 1
+fi
 
 "${OPENMPI_PREFIX}/bin/ompi_info" --version

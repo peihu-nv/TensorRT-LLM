@@ -94,6 +94,7 @@ init_ubuntu() {
     python3-dev \
     python3-pip \
     python-is-python3 \
+    patchelf \
     wget \
     pigz \
     libzmq3-dev
