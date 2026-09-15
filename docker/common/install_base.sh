@@ -111,6 +111,13 @@ init_ubuntu() {
   pip3 install --ignore-installed "setuptools<80"
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
+
+  # HPC-X OpenMPI 5 is relocated from its build-time prefix. Tell PRRTE where
+  # its runtime files are installed before nested MPI_Comm_spawn is used.
+  if [ -d /opt/hpcx/ompi5 ]; then
+    echo 'export PRTE_PREFIX=/opt/hpcx/ompi5' >> "${ENV}"
+  fi
+
   # Remove previous TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then
     apt-get remove --purge -y libnvinfer*
@@ -205,8 +212,8 @@ case "$ID" in
     ;;
 esac
 
-# HPC-X 2.26's OpenMPI 4 runtime lacks the ARM64 wait-sync publication
-# barriers. Apply the upstream fix before mpi4py is installed.
+# HPC-X 2.50's OpenMPI 5 runtime lacks the ARM64 wait-sync publication
+# barriers. Apply the OpenMPI v5.0.x backport before mpi4py is installed.
 bash "$(dirname "${BASH_SOURCE[0]}")/install_openmpi_wait_sync.sh"
 
 # Final cleanup
