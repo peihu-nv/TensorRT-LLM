@@ -50,3 +50,8 @@ rm -rf nixl*  # Remove NIXL source tree to save space
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
 echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
+
+# Prefer the source-built bindings above any pip-installed nixl-cu13 package.
+# The wheel bundles a private UCX copy whose symbols can be interposed by the
+# UCX loaded through OpenMPI 5, corrupting NIXL agent initialization.
+echo 'export PYTHONPATH=/opt/nvidia/nvda_nixl/lib/python3/dist-packages:${PYTHONPATH:-}' >> "${ENV}"
