@@ -2,7 +2,10 @@
 set -ex
 
 GITHUB_URL="https://github.com"
-UCX_INSTALL_PATH="/usr/local/ucx/"
+# Keep NIXL and OpenMPI on the same UCX build. Loading OpenMPI's HPC-X UCX
+# before a NIXL plugin built against /usr/local/ucx can silently substitute the
+# former at runtime and fail once NIXL starts CUDA-IPC transfers.
+UCX_INSTALL_PATH="/opt/hpcx/ucx/"
 CUDA_PATH="/usr/local/cuda"
 NIXL_VERSION="v1.3.1"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
