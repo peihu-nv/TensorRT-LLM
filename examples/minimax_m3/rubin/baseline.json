@@ -1,0 +1,48 @@
+{
+  "trtllm_base": "0c58480ca680f2946bb94315af3517c9c7000bca",
+  "msa_base": "c8e1013a16a708d2a7656805d5fc26f2b87715d1",
+  "cutlass_base": "dc45f979ae336a235da1676b311f35efeb30149a",
+  "hardware": "Rubin SM107",
+  "topology": {
+    "ctx_replicas": 1,
+    "ctx_tp": 2,
+    "gen_replicas": 2,
+    "gen_tp": 4,
+    "serving_gpus": 10
+  },
+  "concurrency": 40,
+  "measurement_seconds": 3600,
+  "forced_draft_acceptance": 1.78,
+  "aiperf_commit": "b7b16cf851885567988a643282266bce74e34437",
+  "dataset": "semianalysisai/cc-traces-weka-062126",
+  "dataset_revision": "23f152f6f0f9399a85901b89a6458def0ef16729",
+  "nvfp4_kv": {
+    "total_served_tokens_per_second_per_gpu": 26833.365503207053,
+    "output_tokens_per_second_per_gpu": 176.06457032266604,
+    "x_reciprocal_p90_tpot": 310.8996774447649,
+    "p90_positive_tpot_ms": 3.216471654840048,
+    "p90_ttft_seconds": 7.500499426600004,
+    "p90_e2e_seconds": 12.932071021100002,
+    "realized_prompt_cache_read_percent": 96.78381963817277
+  },
+  "fp8_kv": {
+    "total_served_tokens_per_second_per_gpu": 22136.72156728196,
+    "output_tokens_per_second_per_gpu": 152.76606851664422,
+    "x_reciprocal_p90_tpot": 304.8821845776982,
+    "p90_positive_tpot_ms": 3.279955506042871,
+    "p90_ttft_seconds": 16.62709697040001,
+    "p90_e2e_seconds": 23.030689665800004,
+    "realized_prompt_cache_read_percent": 90.87552307327414
+  },
+  "natural_acceptance_gsm8k": {
+    "nvfp4_correct": 1280,
+    "fp8_correct": 1281,
+    "total": 1319
+  },
+  "limitations": [
+    "Single full performance point per dtype; run-to-run variance unmeasured.",
+    "Served throughput includes reused input tokens; cache-hit fractions differ.",
+    "Saved GPU validation predates this packaging commit; no new hardware run claimed.",
+    "Sparse prefill uses patched native MSA; decode and indexer retain TRT-LLM implementations."
+  ]
+}

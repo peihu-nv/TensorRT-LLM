@@ -21,6 +21,7 @@ module-scope import here would close a cycle.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -315,6 +316,43 @@ def run_msa_prefill_gqa(
         if row_first != 0:
             raise ValueError("NVFP4 sparse prefill must cover the context prefix")
         k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, kv_scale_quant_orig)
+        if os.environ.get("TRTLLM_MSA_NVDEV_PREFILL") == "1":
+            from tensorrt_llm.logger import logger
+
+            from .msa_nvdev import run_nvfp4_prefill
+
+            logger.info_once(
+                "MiniMax-M3 nv_dev Q8KV4 prefill: calibrated globals, swizzle4x4 V scales, independent page strides",
+                key="minimax_m3_nvdev_q8kv4_prefill",
+            )
+            block_scales = metadata.kv_cache_manager.get_block_scale_buffers(attn.layer_idx, "HND")
+            logger.info_once(
+                f"MSA nv_dev NVFP4 cache geometry: K shape={tuple(k_paged.shape)} "
+                f"stride={tuple(k_paged.stride())}; V stride={tuple(v_paged.stride())}; "
+                f"scales shape={tuple(block_scales.shape)} stride={tuple(block_scales.stride())}",
+                key="minimax_m3_nvdev_q8kv4_geometry",
+            )
+            max_q, max_k, total_k, total_rows = metadata._msa_context_prefix_bounds
+            run_nvfp4_prefill(
+                q_view,
+                k_paged,
+                v_paged,
+                block_scales[:, 0],
+                block_scales[:, 1],
+                k_scale,
+                v_scale,
+                kv_block_indexes.permute(1, 0, 2).contiguous(),
+                metadata.msa_cu_q_lens[: num_rows + 1],
+                metadata.msa_cu_kv_lens[: num_rows + 1],
+                metadata.msa_block_table[:num_rows],
+                total_k=total_k,
+                total_rows=total_rows,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                sm_scale=sm_scale,
+                out=out_view,
+            )
+            return
         run_msa_nvfp4_sparse_gqa(
             q_view,
             k_paged,
@@ -336,6 +374,35 @@ def run_msa_prefill_gqa(
     use_fp8 = k_paged.dtype == torch.float8_e4m3fn
     if use_fp8:
         q_view = q_view.to(torch.float8_e4m3fn)
+
+    if kv_block_indexes is not None and os.environ.get("TRTLLM_MSA_NVDEV_PREFILL") == "1":
+        from tensorrt_llm.logger import logger
+
+        from .msa_nvdev import run_fp8_prefill
+
+        if not use_fp8 or row_first != 0:
+            raise ValueError("MSA nv_dev FP8 prefill requires an FP8 cache and context prefix")
+        logger.info_once(
+            "MiniMax-M3 nv_dev Q8KV8 prefill: public plan/run wrapper, virtual cache pages",
+            key="minimax_m3_nvdev_q8kv8_prefill",
+        )
+        max_q, max_k, total_k, total_rows = metadata._msa_context_prefix_bounds
+        run_fp8_prefill(
+            q_view,
+            k_paged,
+            v_paged,
+            kv_block_indexes.permute(1, 0, 2).contiguous(),
+            metadata.msa_cu_q_lens[: num_rows + 1],
+            metadata.msa_cu_kv_lens[: num_rows + 1],
+            metadata.msa_block_table[:num_rows],
+            total_k=total_k,
+            total_rows=total_rows,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            sm_scale=sm_scale,
+            out=out_view,
+        )
+        return
 
     def rows_of(lens: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Narrow a per-request host length tensor to this phase's rows.

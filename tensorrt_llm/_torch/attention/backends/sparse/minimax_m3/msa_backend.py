@@ -31,6 +31,7 @@ load this module, so trtllm's import chain does not come back here.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
@@ -450,7 +451,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        if getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4:
+        # Both native nv_dev formats consume cumulative lengths and CSR bounds.
+        if (
+            getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4
+            or os.environ.get("TRTLLM_MSA_NVDEV_PREFILL") == "1"
+        ):
             self.msa_cu_q_lens = self.get_empty(
                 buffers,
                 (max_num_sequences + 1,),

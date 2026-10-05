@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Replace speculative_model_dir with your local Eagle3 checkpoint path.
+attention_dp_config:
+  enable_kv_cache_aware_routing: false
+  kv_cache_routing_conversation_affinity: true
+  kv_cache_routing_max_sessions: 65536
+cache_transceiver_config:
+  agent_bounce_buffer_enable: true
+  backend: NIXL
+  kv_cache_bounce_size_mb: 1024
+  kv_transfer_timeout_ms: 600000
+  transceiver_runtime: PYTHON
+cuda_graph_config:
+  batch_sizes:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 8
+  - 10
+  - 12
+  - 14
+  - 16
+  enable_padding: true
+  max_batch_size: 16
+enable_attention_dp: false
+enable_autotuner: true
+enable_iter_perf_stats: false
+enable_lm_head_tp_in_adp: false
+kv_cache_config:
+  avg_seq_len: 220000
+  dtype: fp8
+  enable_block_reuse: false
+  event_buffer_max_size: 0
+  free_gpu_memory_fraction: 0.9
+  host_cache_size: 193273528320
+  tokens_per_block: 128
+  use_kv_cache_manager_v2: true
+max_batch_size: 16
+max_num_tokens: 16
+max_seq_len: 1048576
+moe_config:
+  backend: TRTLLM
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 1
+num_postprocess_workers: 4
+pipeline_parallel_size: 1
+print_iter_log: false
+return_perf_metrics: false
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+sparse_attention_config:
+  algorithm: minimax_m3
+  fuse_qkv_index_projection: true
+  implementation: msa
+  indexer_kv_dtype: fp8
+  sparse_disable_index_value: true
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model_dir: /models/minimax-m3-eagle3-gqa
+stream_interval: 20
+tensor_parallel_size: 4
+trust_remote_code: true
