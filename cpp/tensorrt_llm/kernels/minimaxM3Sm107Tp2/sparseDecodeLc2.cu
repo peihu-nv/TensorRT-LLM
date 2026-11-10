@@ -214,33 +214,17 @@ __global__ void __launch_bounds__(kThreads) m3_lc_attn_kernel(__grid_constant__ 
     // Every peer must be running before its shared memory takes a DSMEM store: arrive now, wait before pushing.
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 
-    // Pre-wait read contract: everything that does not depend on the top-16 table is read before the grid dependency.
+    // Pre-wait read contract: inputs that do not depend on the top-16 table or q are read before the grid dependency.
     // - seq_lens: written inside the step's graph by msa_kv_update (the KV-length correction). That kernel is a plain
     //   launch, not a programmatic dependent, so it has completed before any later kernel of the step starts.
-    // - the query rows: written by the producer, two grids back. This holds only while every kernel between the
-    //   producer and this grid (the long-row select) triggers its dependents after its own griddepcontrol.wait, so
-    //   this grid cannot start before the producer completed. A kernel inserted into that chain, or a select that
-    //   triggers before its wait, breaks it: these reads then move after the griddepcontrol.wait below.
+    // - the query rows are NOT read here: on identity-selection steps no kernel that waits before triggering sits
+    //   between the producer and this grid, so they are read after the griddepcontrol.wait below.
     int const req = tok / p.dql;
     int const qoff = tok - req * p.dql;
     int const seq = p.seq_lens[req];
     int const kv_len = max(seq - p.dql + qoff + 1, 0);
     int const nblocks = (kv_len + kPage - 1) / kPage;
     int const real_topk = min(kTopk, nblocks);
-    // q: 16 heads x 128 e4m3 -> fp16; thread = (head, 16-value chunk).
-    {
-        int const h = tid >> 3;
-        int const c = (tid & 7) * 16;
-        uint4 const w = *reinterpret_cast<uint4 const*>(p.q + tok * p.q_tok + (kvh * kHeads + h) * p.q_head + c);
-        uint32_t const words[4] = {w.x, w.y, w.z, w.w};
-        uint32_t* d = reinterpret_cast<uint32_t*>(s.qs + h * kPitch + c);
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-        {
-            d[2 * i] = e4m3x2_to_f16x2(static_cast<uint16_t>(words[i] & 0xFFFF));
-            d[2 * i + 1] = e4m3x2_to_f16x2(static_cast<uint16_t>(words[i] >> 16));
-        }
-    }
 
     // PREWAIT: the request's block-table row (written before the graph runs) is staged before the grid dependency.
     int* const s_bt = reinterpret_cast<int*>(smem_raw + sizeof(Smem));
@@ -288,6 +272,21 @@ __global__ void __launch_bounds__(kThreads) m3_lc_attn_kernel(__grid_constant__ 
     if constexpr (EARLY)
     {
         asm volatile("griddepcontrol.launch_dependents;");
+    }
+    // q: 16 heads x 128 e4m3 -> fp16; thread = (head, 16-value chunk). Read only after the grid dependency: the
+    // producer may release this grid before writing q (on identity-selection steps nothing that waits sits between).
+    {
+        int const h = tid >> 3;
+        int const c = (tid & 7) * 16;
+        uint4 const w = *reinterpret_cast<uint4 const*>(p.q + tok * p.q_tok + (kvh * kHeads + h) * p.q_head + c);
+        uint32_t const words[4] = {w.x, w.y, w.z, w.w};
+        uint32_t* d = reinterpret_cast<uint32_t*>(s.qs + h * kPitch + c);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            d[2 * i] = e4m3x2_to_f16x2(static_cast<uint16_t>(words[i] & 0xFFFF));
+            d[2 * i + 1] = e4m3x2_to_f16x2(static_cast<uint16_t>(words[i] >> 16));
+        }
     }
     int blk = static_cast<int>(rank) < real_topk ? p.topk[kvh * p.t_h + tok * p.t_tok + rank * p.t_k] : -1;
     if (n1 && tid == 64)
